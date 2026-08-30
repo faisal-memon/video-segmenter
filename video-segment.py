@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Split a video wherever a sustained full-screen blue marker appears.
+"""Split a video wherever a sustained full-screen marker appears.
 
-The blue marker frames are omitted.  Output clips are re-encoded for exact
+Marker frames are omitted.  Output clips are re-encoded for exact
 frame boundaries; the source video is never changed.
 """
 
@@ -55,7 +55,29 @@ def mean_rgb_from_image(image):
     return tuple(sum(raw[offset::3]) / pixels for offset in range(3))
 
 
-def blue_runs(video, fps, marker_rgb, minimum_seconds):
+def frame_matches_marker(frame, marker_rgb):
+    """Return True when most sampled pixels match a solid-color marker."""
+    marker_peak = max(marker_rgb)
+    dominant = marker_rgb.index(marker_peak)
+    other_channels = [value for index, value in enumerate(marker_rgb) if index != dominant]
+    color_separation = marker_peak - max(other_channels)
+    if color_separation < 20:
+        raise ValueError("marker images must have a clearly dominant color")
+    brightness_floor = max(50, marker_peak * 0.40)
+    separation_floor = max(25, color_separation * 0.20)
+    pixels = len(frame) // 3
+    matching_pixels = 0
+    for index in range(0, len(frame), 3):
+        channels = frame[index:index + 3]
+        if (
+            channels[dominant] >= brightness_floor
+            and channels[dominant] - max(channels[(dominant + 1) % 3], channels[(dominant + 2) % 3]) >= separation_floor
+        ):
+            matching_pixels += 1
+    return matching_pixels / pixels >= 0.82
+
+
+def marker_runs(video, fps, marker_rgbs, minimum_seconds):
     process = subprocess.Popen([
         "ffmpeg", "-v", "error", "-i", str(video),
         "-vf", f"fps={fps},scale={SAMPLE_WIDTH}:{SAMPLE_HEIGHT},format=rgb24",
@@ -65,33 +87,16 @@ def blue_runs(video, fps, marker_rgb, minimum_seconds):
     run_start = None
     runs = []
     frame_number = 0
-    marker_r, marker_g, marker_b = marker_rgb
 
     while True:
         frame = process.stdout.read(frame_bytes)
         if len(frame) != frame_bytes:
             break
-        pixels = SAMPLE_WIDTH * SAMPLE_HEIGHT
-        r = sum(frame[0::3]) / pixels
-        g = sum(frame[1::3]) / pixels
-        b = sum(frame[2::3]) / pixels
-        blue_pixels = sum(
-            1 for i in range(0, len(frame), 3)
-            if frame[i + 2] >= 70
-            and frame[i + 2] - max(frame[i], frame[i + 1]) >= 35
-        )
-        # A marker must be strongly blue across nearly the whole image.  The
-        # marker image supplies a brightness floor, which helps avoid shadows.
-        is_blue = (
-            blue_pixels / pixels >= 0.82
-            and b >= max(70, marker_b * 0.45)
-            and b >= r * 1.35
-            and b >= g * 1.20
-        )
+        is_marker = any(frame_matches_marker(frame, marker_rgb) for marker_rgb in marker_rgbs)
         timestamp = frame_number / fps
-        if is_blue and run_start is None:
+        if is_marker and run_start is None:
             run_start = timestamp
-        elif not is_blue and run_start is not None:
+        elif not is_marker and run_start is not None:
             if timestamp - run_start >= minimum_seconds:
                 runs.append((run_start, timestamp))
             run_start = None
@@ -116,8 +121,8 @@ def write_clip(source, start, end, destination, crf):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("video", type=Path)
-    parser.add_argument("--marker", type=Path, default=Path("Blue marker.png"),
-                        help="reference blue-marker image (default: Blue marker.png)")
+    parser.add_argument("--marker", type=Path, action="append", default=[],
+                        help="reference marker image; repeat for multiple markers")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--minimum-blue-seconds", type=float, default=0.5)
     parser.add_argument("--crf", type=float, default=15,
@@ -126,19 +131,21 @@ def main():
                         help="report markers and clips, but create no videos")
     args = parser.parse_args()
 
-    if not args.video.is_file() or not args.marker.is_file():
-        parser.error("the video and marker image must both exist")
+    marker_paths = args.marker or [Path("Blue marker.png")]
+    if not args.video.is_file() or any(not marker.is_file() for marker in marker_paths):
+        parser.error("the video and all marker images must exist")
     if args.minimum_blue_seconds <= 0:
         parser.error("--minimum-blue-seconds must be positive")
     if not 0 <= args.crf <= 51:
         parser.error("--crf must be between 0 and 51")
 
     fps, duration = probe(args.video)
-    marker_rgb = mean_rgb_from_image(args.marker)
+    marker_rgbs = [mean_rgb_from_image(marker) for marker in marker_paths]
     print(f"Video: {duration:.1f}s at {fps:.3f} fps")
-    print("Marker average RGB: " + ", ".join(f"{value:.0f}" for value in marker_rgb))
-    markers = blue_runs(args.video, fps, marker_rgb, args.minimum_blue_seconds)
-    print(f"Found {len(markers)} blue marker(s):")
+    for marker, marker_rgb in zip(marker_paths, marker_rgbs):
+        print(f"Marker {marker}: RGB " + ", ".join(f"{value:.0f}" for value in marker_rgb))
+    markers = marker_runs(args.video, fps, marker_rgbs, args.minimum_blue_seconds)
+    print(f"Found {len(markers)} marker(s):")
     for start, end in markers:
         print(f"  {format_timestamp(start)} to {format_timestamp(end)} ({end - start:.3f}s)")
 
